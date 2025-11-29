@@ -35,11 +35,14 @@ def human_readable_speed(mbps):
     return f"{mbps:.2f} Mbps"
 
 def measure_download_speed():
-    st = speedtest.Speedtest()
-    st.get_best_server()
-    st.download(threads=None)
-    dl_bps = st.results.dict().get("download", 0)
-    return dl_bps / 1_000_000.0
+    try:
+        st = speedtest.Speedtest()
+        st.get_best_server()
+        st.download(threads=None)
+        dl_bps = st.results.dict().get("download", 0)
+        return dl_bps / 1_000_000.0
+    except Exception:
+        return 10  # Default speed if test fails
 
 def choose_connections(mbps):
     for threshold, conns in CONNECTION_THRESHOLDS:
@@ -56,7 +59,7 @@ def safe_outtmpl(output_dir):
     return str(Path(output_dir) / "%(title).200s.%(ext)s")
 
 # -----------------------------------------------------------
-# MAIN FUNCTION - Prevent duplicate downloads
+# MAIN FUNCTION - Updated to handle YouTube bot detection
 # -----------------------------------------------------------
 def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep_original=True, progress_hook=None):
     # Backward compatibility: if output_dir not provided, use old default
@@ -83,20 +86,38 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
     external_downloader = "aria2c" if use_aria2 else None
     external_downloader_args = ["-x", str(connections), "-s", str(connections), "-k", "1M"] if use_aria2 else []
 
+    # Enhanced yt-dlp options to avoid bot detection
     ytdlp_opts = {
         "format": "bestaudio/best",
         "outtmpl": safe_outtmpl(output_dir),
         "noplaylist": True,
-        "quiet": False,
-        "no_warnings": True,
-        "ignoreerrors": False,
+        "quiet": True,  # Set to True to reduce logs
+        "no_warnings": False,  # Set to False to see warnings
+        "ignoreerrors": True,  # Continue on download errors
         "postprocessors": [],
         "skip_download": False,
         "external_downloader": external_downloader,
         "external_downloader_args": external_downloader_args,
         "writeinfojson": False,
-        # Prevent duplicate downloads by overwriting existing files
         "overwrites": True,
+        
+        # Anti-bot detection settings
+        "extract_flat": False,
+        "http_headers": {
+            "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36",
+            "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+            "Accept-Language": "en-us,en;q=0.5",
+            "Accept-Encoding": "gzip,deflate",
+            "Accept-Charset": "ISO-8859-1,utf-8;q=0.7,*;q=0.7",
+            "Connection": "keep-alive",
+        },
+        "sleep_interval": 1,  # Add delay between requests
+        "max_sleep_interval": 2,
+        "retries": 10,  # Increase retries
+        "fragment_retries": 10,
+        "skip_unavailable_fragments": True,
+        "keep_fragments": False,
+        "noprogress": True,
     }
 
     if progress_hook:
@@ -104,9 +125,28 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
 
     try:
         with YoutubeDL(ytdlp_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
+            # Add additional error handling
+            try:
+                info = ydl.extract_info(url, download=True)
+            except Exception as e:
+                # Try one more time with different approach
+                print(f"First attempt failed: {e}. Retrying...")
+                # Remove some restrictive options for retry
+                ytdlp_opts_retry = ytdlp_opts.copy()
+                ytdlp_opts_retry["quiet"] = False  # Show more info on retry
+                with YoutubeDL(ytdlp_opts_retry) as ydl_retry:
+                    info = ydl_retry.extract_info(url, download=True)
+                    
     except Exception as e:
-        raise RuntimeError(f"yt-dlp failed: {e}")
+        error_msg = str(e)
+        if "Sign in to confirm you're not a bot" in error_msg:
+            raise RuntimeError("YouTube is requesting bot verification. Please try a different video or try again later.")
+        elif "Private video" in error_msg:
+            raise RuntimeError("This is a private video and cannot be downloaded.")
+        elif "Video unavailable" in error_msg:
+            raise RuntimeError("This video is unavailable or has been removed.")
+        else:
+            raise RuntimeError(f"Download failed: {error_msg}")
 
     # ---- FILE DETECTION ----
     downloaded_file = None
@@ -130,7 +170,7 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
             downloaded_file = max(files, key=lambda x: x.stat().st_mtime)
 
     if not downloaded_file:
-        raise RuntimeError("Could not find downloaded audio file.")
+        raise RuntimeError("Could not find downloaded audio file. The download may have failed.")
 
     print("Downloaded:", downloaded_file)
     
@@ -154,7 +194,7 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
     # ---- MP3 conversion ----
     if convert_to_mp3:
         if not check_tool_exists("ffmpeg"):
-            raise RuntimeError("ffmpeg not found")
+            raise RuntimeError("ffmpeg not found - MP3 conversion unavailable")
 
         mp3_path = output_path / (downloaded_file.stem + ".mp3")
         
@@ -169,11 +209,19 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
             "-vn",
             "-codec:a", "libmp3lame",
             "-b:a", "320k",
+            "-ac", "2",  # Force stereo
+            "-ar", "44100",  # Standard sample rate
             str(mp3_path)
         ]
 
         print("Converting to MP3...")
-        subprocess.run(cmd, check=True, capture_output=True)
+        try:
+            result = subprocess.run(cmd, check=True, capture_output=True, text=True)
+            print("MP3 conversion completed successfully")
+        except subprocess.CalledProcessError as e:
+            print(f"FFmpeg error: {e.stderr}")
+            raise RuntimeError(f"MP3 conversion failed: {e.stderr}")
+        
         print("MP3 saved:", mp3_path)
         
         # Add MP3 file info
