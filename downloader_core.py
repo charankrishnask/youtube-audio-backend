@@ -59,7 +59,7 @@ def safe_outtmpl(output_dir):
     return str(Path(output_dir) / "%(title).200s.%(ext)s")
 
 # -----------------------------------------------------------
-# MAIN FUNCTION - Updated to handle YouTube bot detection
+# MAIN FUNCTION - Fixed NoneType iteration error
 # -----------------------------------------------------------
 def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep_original=True, progress_hook=None):
     # Backward compatibility: if output_dir not provided, use old default
@@ -91,9 +91,9 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
         "format": "bestaudio/best",
         "outtmpl": safe_outtmpl(output_dir),
         "noplaylist": True,
-        "quiet": True,  # Set to True to reduce logs
-        "no_warnings": False,  # Set to False to see warnings
-        "ignoreerrors": True,  # Continue on download errors
+        "quiet": True,
+        "no_warnings": False,
+        "ignoreerrors": True,
         "postprocessors": [],
         "skip_download": False,
         "external_downloader": external_downloader,
@@ -111,9 +111,9 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
             "Accept-Charset": "ISO-8859-1,utf-8;q=0.7,*;q=0.7",
             "Connection": "keep-alive",
         },
-        "sleep_interval": 1,  # Add delay between requests
+        "sleep_interval": 1,
         "max_sleep_interval": 2,
-        "retries": 10,  # Increase retries
+        "retries": 10,
         "fragment_retries": 10,
         "skip_unavailable_fragments": True,
         "keep_fragments": False,
@@ -125,15 +125,12 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
 
     try:
         with YoutubeDL(ytdlp_opts) as ydl:
-            # Add additional error handling
             try:
                 info = ydl.extract_info(url, download=True)
             except Exception as e:
-                # Try one more time with different approach
                 print(f"First attempt failed: {e}. Retrying...")
-                # Remove some restrictive options for retry
                 ytdlp_opts_retry = ytdlp_opts.copy()
-                ytdlp_opts_retry["quiet"] = False  # Show more info on retry
+                ytdlp_opts_retry["quiet"] = False
                 with YoutubeDL(ytdlp_opts_retry) as ydl_retry:
                     info = ydl_retry.extract_info(url, download=True)
                     
@@ -148,34 +145,48 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
         else:
             raise RuntimeError(f"Download failed: {error_msg}")
 
-    # ---- FILE DETECTION ----
+    # ---- FIXED FILE DETECTION ----
     downloaded_file = None
 
-    if "requested_downloads" in info:
-        for req in info["requested_downloads"]:
-            fp = req.get("filepath")
-            if fp and Path(fp).exists():
-                downloaded_file = Path(fp)
-                break
+    # Check if info is None (download might have failed silently)
+    if info is None:
+        raise RuntimeError("Download failed - no video information received from YouTube")
 
-    if not downloaded_file and "filepath" in info:
-        fp = info["filepath"]
+    # Safely check requested_downloads with None check
+    if info and "requested_downloads" in info and info["requested_downloads"]:
+        for req in info["requested_downloads"]:
+            if req and "filepath" in req:
+                fp = req.get("filepath")
+                if fp and Path(fp).exists():
+                    downloaded_file = Path(fp)
+                    break
+
+    # Check filepath in info
+    if not downloaded_file and info and "filepath" in info:
+        fp = info.get("filepath")
         if fp and Path(fp).exists():
             downloaded_file = Path(fp)
 
+    # Search for recently created files as fallback
     if not downloaded_file:
-        # Try to find the most recently created file in the output directory
-        files = list(output_path.glob("*"))
-        if files:
-            downloaded_file = max(files, key=lambda x: x.stat().st_mtime)
+        try:
+            files = list(output_path.glob("*"))
+            if files:
+                # Filter out non-audio files and get the most recent
+                audio_files = [f for f in files if f.suffix.lower() in ['.webm', '.m4a', '.mp3', '.ogg', '.wav']]
+                if audio_files:
+                    downloaded_file = max(audio_files, key=lambda x: x.stat().st_mtime)
+                    print(f"Found file via fallback: {downloaded_file}")
+        except Exception as e:
+            print(f"Error searching for files: {e}")
 
     if not downloaded_file:
-        raise RuntimeError("Could not find downloaded audio file. The download may have failed.")
+        raise RuntimeError("Could not find downloaded audio file. The download may have completed but file was not found.")
 
     print("Downloaded:", downloaded_file)
     
     # SIMPLIFIED OUTPUT FORMAT
-    video_title = info.get('title', 'Unknown Title')
+    video_title = info.get('title', 'Unknown Title') if info else 'Unknown Title'
     results = {
         "title": video_title,
         "status": "success",
@@ -198,19 +209,19 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
 
         mp3_path = output_path / (downloaded_file.stem + ".mp3")
         
-        # Remove existing MP3 file if it exists (prevent duplicates)
+        # Remove existing MP3 file if it exists
         if mp3_path.exists():
             mp3_path.unlink()
             print("Removed existing MP3 file to prevent duplicates")
 
         cmd = [
-            "ffmpeg", "-y",  # -y to overwrite output file
+            "ffmpeg", "-y",
             "-i", str(downloaded_file),
             "-vn",
             "-codec:a", "libmp3lame",
             "-b:a", "320k",
-            "-ac", "2",  # Force stereo
-            "-ar", "44100",  # Standard sample rate
+            "-ac", "2",
+            "-ar", "44100",
             str(mp3_path)
         ]
 
@@ -235,7 +246,6 @@ def download_audio_from_youtube(url, output_dir=None, convert_to_mp3=False, keep
 
         if not keep_original and downloaded_file.exists():
             downloaded_file.unlink()
-            # Remove original from results if deleted
             results["files"] = [f for f in results["files"] if f["type"] != "original"]
             print("Original file removed as requested")
 
